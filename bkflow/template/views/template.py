@@ -205,7 +205,7 @@ class AdminTemplateViewSet(TenantScopeMixin, AdminModelViewSet):
             label_ids = ser.validated_data.pop("label_ids", [])
             username = request.user.username
             if SpaceConfig.get_config(space_id=space_id, config_name=FlowVersioning.name) == "true":
-                snapshot = TemplateSnapshot.create_draft_snapshot(pipeline_tree, username)
+                snapshot = TemplateSnapshot.create_unpublished_snapshot(pipeline_tree, username, draft=True)
             else:
                 snapshot = TemplateSnapshot.create_snapshot(pipeline_tree, username, "1.0.0")
             template = Template.objects.create(
@@ -438,18 +438,26 @@ class TemplateVersionViewSet(
 
         if SpaceConfig.get_config(space_id=template_obj.space_id, config_name=FlowVersioning.name) != "true":
             return Response(exception=True, data={"detail": "版本管理功能未开启，无法删除版本快照"})
-        if instance.draft or template_obj.snapshot_id == instance.id:
-            return Response({"detail": "草稿或最新版本无法删除"})
-        referencing_templates = TemplateReference.objects.filter(
-            subprocess_template_id=instance.template_id, version=instance.version
-        )
-        if referencing_templates.exists():
-            root_template_ids = referencing_templates.values_list("root_template_id", flat=True).distinct()
-            referencing_templates = Template.objects.filter(id__in=root_template_ids, is_deleted=False)
+        if template_obj.snapshot_id == instance.id:
+            return Response({"detail": "该版本是流程正在使用的快照，无法删除"})
+
+        # 草稿或缓存版本：直接删除，无需引用检查
+        if instance.draft or instance.cache:
+            pass
+        elif not instance.is_deleted:
+            referencing_templates = TemplateReference.objects.filter(
+                subprocess_template_id=instance.template_id,
+                version=instance.version,
+            )
             if referencing_templates.exists():
-                referencing_ids = list(referencing_templates.values_list("id", flat=True))
-                referencing_ids_str = [str(id_) for id_ in referencing_ids]
-                return Response({"detail": f"版本【{instance.version}】被流程 {', '.join(list(referencing_ids_str))} 引用，无法删除"})
+                root_template_ids = referencing_templates.values_list("root_template_id", flat=True).distinct()
+                referencing_templates = Template.objects.filter(id__in=root_template_ids, is_deleted=False)
+                if referencing_templates.exists():
+                    referencing_ids = list(referencing_templates.values_list("id", flat=True))
+                    referencing_ids_str = [str(id_) for id_ in referencing_ids]
+                    return Response(
+                        {"detail": f"版本【{instance.version}】被流程 {', '.join(list(referencing_ids_str))} 引用，无法删除"}
+                    )
 
         instance.is_deleted = True
         instance.save()
@@ -724,20 +732,19 @@ class TemplateViewSet(TenantScopeMixin, UserModelViewSet):
         template_obj = self.get_object()
         if SpaceConfig.get_config(space_id=template_obj.space_id, config_name=FlowVersioning.name) != "true":
             return Response(exception=True, data={"message": "当前空间未开启版本管理, 无法获取草稿"})
-        try:
-            draft_snapshot = TemplateSnapshot.objects.get(template_id=template_obj.id, draft=True)
-        except TemplateSnapshot.DoesNotExist:
-            draft_snapshot = template_obj.update_draft_snapshot(
-                template_obj.pipeline_tree, request.user.username, template_obj.version
-            )
-        data = TemplateSnapshotSerializer(draft_snapshot).data
+
+        draft_snapshot = (
+            TemplateSnapshot.objects.filter(template_id=template_obj.id, draft=True).order_by("-id").first()
+        )
+        if not draft_snapshot:
+            draft_data = template_obj.pipeline_tree
+        else:
+            draft_data = draft_snapshot.data
         flow_version_config = (
             SpaceConfig.get_config(space_id=template_obj.space_id, config_name=FlowVersioning.name) == "true"
         )
-        pipeline_tree = replace_subprocess_version(draft_snapshot.data, flow_version_config)
-
-        data["pipeline_tree"] = pipeline_tree
-        return Response(data=data)
+        pipeline_tree = replace_subprocess_version(draft_data, flow_version_config)
+        return Response(data={"pipeline_tree": pipeline_tree})
 
     @action(methods=["GET"], detail=True, url_path="calculate_version")
     def calculate_version(self, request, *args, **kwargs):
@@ -800,20 +807,30 @@ class TemplateViewSet(TenantScopeMixin, UserModelViewSet):
         instance = self.get_object()
         if SpaceConfig.get_config(space_id=instance.space_id, config_name=FlowVersioning.name) != "true":
             return Response(exception=True, data={"detail": "当前空间未开启版本管理，无法回滚模板"})
-        version = request.data.get("version")
-        if not version:
-            return Response({"detail": "version 参数不能为空"})
-
-        pipeline_tree = TemplateSnapshot.objects.get(template_id=instance.id, version=version).data
-        draft_template = instance.update_draft_snapshot(pipeline_tree, request.user.username, version)
+        snapshot_id = request.data.get("snapshot_id")
+        if not snapshot_id:
+            return Response({"detail": "snapshot_id 参数不能为空"})
+        try:
+            snapshot = TemplateSnapshot.objects.get(id=snapshot_id, template_id=instance.id)
+        except TemplateSnapshot.DoesNotExist:
+            return Response({"detail": "快照不存在"})
         TemplateOperationRecord.objects.create(
             operate_source=TemplateOperationSource.app.name,
             operate_type=TemplateOperationType.rollback.name,
             instance_id=instance.id,
             operator=request.user.username,
-            extra_info={"version": version},
         )
-        return Response(data=draft_template.data)
+        return Response(data=snapshot.data)
+
+    @action(methods=["POST"], detail=True, url_path="save_cache_template")
+    def save_cache_template(self, request, *args, **kwargs):
+        template = self.get_object()
+        pipeline_tree = request.data.get("pipeline_tree")
+        username = request.user.username
+        TemplateSnapshot.create_unpublished_snapshot(
+            pipeline_tree=pipeline_tree, username=username, cache=True, template_id=template.id
+        )
+        return Response(data={"message": "success"})
 
     @swagger_auto_schema(
         method="get",

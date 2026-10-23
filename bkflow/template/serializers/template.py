@@ -207,7 +207,7 @@ class TemplateSerializer(serializers.ModelSerializer):
             scope_id=validated_data.get("scope_value") or self.initial_data.get("scope_value"),
         )
         if SpaceConfig.get_config(space_id=space_id, config_name=FlowVersioning.name) == "true":
-            snapshot = TemplateSnapshot.create_draft_snapshot(pipeline_tree, username)
+            snapshot = TemplateSnapshot.create_unpublished_snapshot(pipeline_tree, username, draft=True)
         else:
             snapshot = TemplateSnapshot.create_snapshot(pipeline_tree, username, "1.0.0")
         validated_data["snapshot_id"] = snapshot.id
@@ -270,7 +270,14 @@ class TemplateSerializer(serializers.ModelSerializer):
             scope_id=validated_data.get("scope_value", instance.scope_value),
         )
         if SpaceConfig.get_config(space_id=instance.space_id, config_name=FlowVersioning.name) == "true":
-            instance.update_draft_snapshot(pipeline_tree, username)
+            count = TemplateSnapshot.objects.filter(template_id=instance.id, draft=True).count()
+            if count >= settings.MAX_TEMPLATE_DRAFT_COUNT:
+                instance.update_snapshot(pipeline_tree)
+            else:
+                snapshot = TemplateSnapshot.create_unpublished_snapshot(pipeline_tree, username, draft=True)
+                instance.snapshot_id = snapshot.id
+                snapshot.template_id = instance.id
+                snapshot.save(update_fields=["template_id"])
         else:
             if instance.snapshot_version is None:
                 current_version = "1.0.0"
@@ -473,6 +480,7 @@ class TemplateSnapshotSerializer(serializers.ModelSerializer):
             "template_id",
             "desc",
             "draft",
+            "cache",
             "creator",
             "operator",
             "md5sum",

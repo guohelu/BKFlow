@@ -20,6 +20,7 @@ to the current version of the project delivered to anyone in the future.
 import json
 
 from blueapps.account.decorators import login_exempt
+from django.conf import settings
 from django.db import transaction
 from django.utils.translation import gettext_lazy as _
 from django.views.decorators.csrf import csrf_exempt
@@ -97,13 +98,17 @@ def update_template(request, space_id, template_id):
 
         if pipeline_tree:
             if SpaceConfig.get_config(space_id=space_id, config_name=FlowVersioning.name) == "true":
-                try:
-                    TemplateSnapshot.objects.get(template_id=template_id, draft=True)
-                    template_version = None
-                except TemplateSnapshot.DoesNotExist:
-                    template_version = template.version
-                # 更新草稿数据
-                template.update_draft_snapshot(pipeline_tree, validated_data_dict["updated_by"], template_version)
+
+                count = TemplateSnapshot.objects.filter(template_id=template_id, draft=True).count()
+                if count >= settings.MAX_TEMPLATE_DRAFT_COUNT:
+                    template.update_snapshot(pipeline_tree)
+                else:
+                    snapshot = TemplateSnapshot.create_unpublished_snapshot(
+                        pipeline_tree, request.user.username, draft=True
+                    )
+                    validated_data_dict["snapshot_id"] = snapshot.id
+                    snapshot.template_id = template.id
+                    snapshot.save(update_fields=["template_id"])
 
                 if auto_release:
                     if version:

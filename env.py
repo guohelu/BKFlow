@@ -341,3 +341,5 @@ BK_PLUGIN_SYNC_TENANTS = list(
         tenant.strip() for tenant in os.getenv("BK_PLUGIN_SYNC_TENANTS", "system").split(",") if tenant.strip()
     )
 ) or ["system"]
+
+MAX_TEMPLATE_DRAFT_COUNT = int(os.getenv("MAX_TEMPLATE_DRAFT_COUNT", 20))
